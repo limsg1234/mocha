@@ -13,4 +13,5 @@
   command = "npm start docs"
 
 [build.environment]
+  DEBUG = "mocha:docs*"
   NODE_VERSION = "12"

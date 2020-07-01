@@ -1,17 +1,21 @@
 #!/usr/bin/env node
 'use strict';
 
-const {mkdirSync} = require('fs');
-const {writeFile} = require('fs').promises;
+const {loadImage} = require('canvas');
+const {writeFile, mkdir, rmdir} = require('fs').promises;
 const {resolve} = require('path');
 const debug = require('debug')('mocha:docs:data:supporters');
 const needle = require('needle');
-const imageSize = require('image-size');
 const blocklist = new Set(require('./blocklist.json'));
 
 const API_ENDPOINT = 'https://api.opencollective.com/graphql/v2';
 
-const query = `query account($limit: Int, $offset: Int, $slug: String) {
+const SPONSOR_TIER = 'sponsor';
+const BACKER_TIER = 'backer';
+
+const SUPPORTER_IMAGE_PATH = resolve(__dirname, '../images/supporters');
+
+const SUPPORTER_QUERY = `query account($limit: Int, $offset: Int, $slug: String) {
   account(slug: $slug) {
     orders(limit: $limit, offset: $offset) {
       limit
@@ -36,7 +40,9 @@ const query = `query account($limit: Int, $offset: Int, $slug: String) {
   }
 }`;
 
-const graphqlPageSize = 1000;
+const GRAPHQL_PAGE_SIZE = 1000;
+
+const invalidSupporters = [];
 
 const nodeToSupporter = node => ({
   id: node.fromAccount.id,
@@ -50,6 +56,30 @@ const nodeToSupporter = node => ({
   type: node.fromAccount.type
 });
 
+const fetchImage = async supporter => {
+  try {
+    const url = encodeURI(supporter.avatar);
+    const {body: imageBuf} = await needle('get', url);
+    debug('fetched %s', url);
+    const canvasImage = await loadImage(imageBuf);
+    debug('ok %s', url);
+    supporter.dimensions = {
+      width: canvasImage.width,
+      height: canvasImage.height
+    };
+    debug('dimensions %s %dw %dh', url, canvasImage.width, canvasImage.height);
+    const filePath = resolve(SUPPORTER_IMAGE_PATH, supporter.id + '.png');
+    await writeFile(filePath, imageBuf);
+    debug('wrote %s', filePath);
+  } catch (err) {
+    console.error(
+      `failed to load ${supporter.avatar}; will discard ${supporter.tier} "${supporter.name} (${supporter.slug}). reason:\n`,
+      err
+    );
+    invalidSupporters.push(supporter);
+  }
+};
+
 /**
  * Retrieves donation data from OC
  *
@@ -59,26 +89,26 @@ const nodeToSupporter = node => ({
  */
 const getAllOrders = async (slug = 'mochajs') => {
   let allOrders = [];
-  const variables = {limit: graphqlPageSize, offset: 0, slug};
+  const variables = {limit: GRAPHQL_PAGE_SIZE, offset: 0, slug};
 
   // Handling pagination if necessary (2 pages for ~1400 results in May 2019)
   while (true) {
     const result = await needle(
       'post',
       API_ENDPOINT,
-      {query, variables},
+      {query: SUPPORTER_QUERY, variables},
       {json: true}
     );
     const orders = result.body.data.account.orders.nodes;
     allOrders = [...allOrders, ...orders];
-    variables.offset += graphqlPageSize;
-    if (orders.length < graphqlPageSize) {
+    variables.offset += GRAPHQL_PAGE_SIZE;
+    if (orders.length < GRAPHQL_PAGE_SIZE) {
       debug('retrieved %d orders', allOrders.length);
       return allOrders;
     } else {
       debug(
         'loading page %d of orders...',
-        Math.floor(variables.offset / graphqlPageSize)
+        Math.floor(variables.offset / GRAPHQL_PAGE_SIZE)
       );
     }
   }
@@ -109,45 +139,46 @@ module.exports = async () => {
           if (supporter.name !== 'anonymous') {
             supporters.backers.push({
               ...supporter,
-              avatar: supporter.imgUrlSmall
+              avatar: supporter.imgUrlSmall,
+              tier: BACKER_TIER
             });
           }
         } else {
-          supporters.sponsors.push({...supporter, avatar: supporter.imgUrlMed});
+          supporters.sponsors.push({
+            ...supporter,
+            avatar: supporter.imgUrlMed,
+            tier: SPONSOR_TIER
+          });
         }
         return supporters;
       },
       {sponsors: [], backers: []}
     );
 
-  const supporterImagePath = resolve(__dirname, '../images/supporters');
-
-  mkdirSync(supporterImagePath, {recursive: true});
+  await rmdir(SUPPORTER_IMAGE_PATH, {recursive: true});
+  debug('blasted %s', SUPPORTER_IMAGE_PATH);
+  await mkdir(SUPPORTER_IMAGE_PATH, {recursive: true});
+  debug('created %s', SUPPORTER_IMAGE_PATH);
 
   // Fetch images for sponsors and save their image dimensions
-  await Promise.all(
-    supporters.sponsors.map(async sponsor => {
-      const filePath = resolve(supporterImagePath, sponsor.id + '.png');
-      const {body} = await needle('get', encodeURI(sponsor.avatar));
-      sponsor.dimensions = imageSize(body);
-      await writeFile(filePath, body);
-    })
-  );
+  await Promise.all([
+    ...supporters.sponsors.map(fetchImage),
+    ...supporters.backers.map(fetchImage)
+  ]);
 
-  // Fetch images for backers and save their image dimensions
-  await Promise.all(
-    supporters.backers.map(async backer => {
-      const filePath = resolve(supporterImagePath, backer.id + '.png');
-      const {body} = await needle('get', encodeURI(backer.avatar));
-      await writeFile(filePath, body);
-    })
-  );
+  invalidSupporters.forEach(supporter => {
+    supporters[supporter.tier].splice(
+      supporters[supporter.tier].indexOf(supporter),
+      1
+    );
+  });
 
   debug(
-    'found %d valid backers and %d valid sponsors (%d total)',
+    'found %d valid backers and %d valid sponsors (%d total; %d invalid)',
     supporters.backers.length,
     supporters.sponsors.length,
-    supporters.backers.length + supporters.sponsors.length
+    supporters.backers.length + supporters.sponsors.length,
+    invalidSupporters.length
   );
   return supporters;
 };
